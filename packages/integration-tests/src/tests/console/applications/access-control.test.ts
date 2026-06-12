@@ -1,23 +1,68 @@
-import { ApplicationType, createDefaultApplicationAccessControl, RoleType } from '@logto/schemas';
+import {
+  ApplicationType,
+  createDefaultApplicationAccessControl,
+  RoleType,
+  type SamlApplicationResponse,
+} from '@logto/schemas';
 
+import { authedAdminApi } from '#src/api/api.js';
 import {
   createApplication,
   deleteApplication,
   getApplication,
+  getApplicationAccessControl,
+  getApplications,
   replaceApplicationAccessControl,
   updateApplication,
 } from '#src/api/application.js';
 import { assignUsersToRole, createRole, deleteRole } from '#src/api/role.js';
+import { deleteSamlApplication } from '#src/api/saml-application.js';
 import { logtoConsoleUrl as logtoConsoleUrlString } from '#src/constants.js';
 import { OrganizationApiTest } from '#src/helpers/organization.js';
 import {
   createDefaultTenantUserWithPassword,
   deleteDefaultTenantUser,
 } from '#src/helpers/profile.js';
-import { expectToSaveChanges, goToAdminConsole, waitForToast } from '#src/ui-helpers/index.js';
+import {
+  expectToClickModalAction,
+  expectToSaveChanges,
+  goToAdminConsole,
+  waitForToast,
+} from '#src/ui-helpers/index.js';
 import { appendPathname, devFeatureTest, expectNavigation, generateTestName } from '#src/utils.js';
 
 await page.setViewport({ width: 1920, height: 1080 });
+
+const createOrReuseSamlApplication = async () => {
+  const response = await authedAdminApi.post('saml-applications', {
+    json: {
+      name: generateTestName(),
+      description: null,
+    },
+    throwHttpErrors: false,
+  });
+
+  if (response.ok) {
+    return {
+      application: await response.json<SamlApplicationResponse>(),
+      shouldDelete: true,
+    };
+  }
+
+  const error = await response.json<{ code?: string }>();
+  if (response.status === 403 && error.code === 'application.saml.reach_oss_limit') {
+    const [application] = await getApplications([ApplicationType.SAML]);
+
+    expect(application).toBeDefined();
+
+    return {
+      application: application!,
+      shouldDelete: false,
+    };
+  }
+
+  throw new Error(`Failed to create SAML application: ${response.status} ${error.code ?? ''}`);
+};
 
 devFeatureTest.describe('application access control Console', () => {
   const logtoConsoleUrl = new URL(logtoConsoleUrlString);
@@ -119,6 +164,78 @@ devFeatureTest.describe('application access control Console', () => {
         deleteDefaultTenantUser(user.id),
         deleteRole(userRole.id),
         organizationApi.cleanUp(),
+      ]);
+    }
+  });
+
+  it('renders the rules tab for SAML applications', async () => {
+    const { application: samlApplication, shouldDelete: shouldDeleteSamlApplication } =
+      await createOrReuseSamlApplication();
+
+    try {
+      await expectNavigation(
+        page.goto(
+          appendPathname(`/console/applications/${samlApplication.id}/rules`, logtoConsoleUrl).href
+        )
+      );
+
+      await expect(page).toMatchElement('nav a', { text: 'Rules' });
+      await expect(page).toMatchElement('div[class$=title]', {
+        text: 'Enable app-level access control',
+      });
+    } finally {
+      if (shouldDeleteSamlApplication) {
+        await deleteSamlApplication(samlApplication.id);
+      }
+    }
+  });
+
+  it('adds and removes user rules from the rules tab', async () => {
+    const { user, username } = await createDefaultTenantUserWithPassword();
+    const application = await createApplication(generateTestName(), ApplicationType.SPA);
+
+    try {
+      await expectNavigation(
+        page.goto(
+          appendPathname(`/console/applications/${application.id}/rules`, logtoConsoleUrl).href
+        )
+      );
+
+      await expect(page).toClick('label[class$=switch]');
+      await expect(page).toClick('button span', { text: 'Add rules' });
+      await expect(page).toClick('div[role=menuitem]', { text: 'Users' });
+      await expect(page).toMatchElement('.ReactModalPortal div[class$=title]', { text: 'Users' });
+      await expect(page).toFill('.ReactModalPortal input[placeholder=Search]', username);
+      await expect(page).toClick('.ReactModalPortal div[role=button]', { text: username });
+      await expectToClickModalAction(page, 'Save');
+
+      await expect(page).toMatchElement('table tbody tr td', { text: username });
+      await expectToSaveChanges(page);
+      await waitForToast(page, { text: 'Saved' });
+
+      await expect(getApplication(application.id)).resolves.toMatchObject({
+        appLevelAccessControlEnabled: true,
+      });
+      await expect(getApplicationAccessControl(application.id)).resolves.toMatchObject({
+        userIds: [user.id],
+      });
+
+      await expect(page).toClick('table tbody tr button[aria-label=Remove]');
+      await expectToClickModalAction(page, 'Remove');
+      await expect(page).toClick('label[class$=switch]');
+      await expectToSaveChanges(page);
+      await waitForToast(page, { text: 'Saved' });
+
+      await expect(getApplication(application.id)).resolves.toMatchObject({
+        appLevelAccessControlEnabled: false,
+      });
+      await expect(getApplicationAccessControl(application.id)).resolves.toEqual(
+        createDefaultApplicationAccessControl()
+      );
+    } finally {
+      await Promise.allSettled([
+        deleteApplication(application.id),
+        deleteDefaultTenantUser(user.id),
       ]);
     }
   });
