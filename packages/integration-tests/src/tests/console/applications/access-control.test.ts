@@ -1,4 +1,5 @@
 import {
+  type ApplicationAccessControl,
   ApplicationType,
   createDefaultApplicationAccessControl,
   RoleType,
@@ -16,7 +17,11 @@ import {
   updateApplication,
 } from '#src/api/application.js';
 import { assignUsersToRole, createRole, deleteRole } from '#src/api/role.js';
-import { deleteSamlApplication } from '#src/api/saml-application.js';
+import {
+  deleteSamlApplication,
+  getSamlApplication,
+  updateSamlApplication,
+} from '#src/api/saml-application.js';
 import { logtoConsoleUrl as logtoConsoleUrlString } from '#src/constants.js';
 import { OrganizationApiTest } from '#src/helpers/organization.js';
 import {
@@ -64,6 +69,82 @@ const createOrReuseSamlApplication = async () => {
   throw new Error(`Failed to create SAML application: ${response.status} ${error.code ?? ''}`);
 };
 
+const resetOrDeleteSamlApplication = async ({
+  application,
+  shouldDelete,
+}: Awaited<ReturnType<typeof createOrReuseSamlApplication>>) => {
+  if (shouldDelete) {
+    await deleteSamlApplication(application.id);
+    return;
+  }
+
+  await updateSamlApplication(application.id, { appLevelAccessControlEnabled: false });
+  await replaceApplicationAccessControl(application.id, createDefaultApplicationAccessControl());
+};
+
+const createAccessControlFixtures = async () => {
+  const organizationApi = new OrganizationApiTest();
+  const { user, username } = await createDefaultTenantUserWithPassword();
+  const userRole = await createRole({ name: generateTestName(), type: RoleType.User });
+  const [organization, organizationWithRole] = await Promise.all([
+    organizationApi.create({ name: generateTestName() }),
+    organizationApi.create({ name: generateTestName() }),
+  ]);
+  const organizationRole = await organizationApi.roleApi.create({
+    name: generateTestName(),
+    type: RoleType.User,
+  });
+
+  await Promise.all([
+    assignUsersToRole([user.id], userRole.id),
+    organizationApi.addUsers(organization.id, [user.id]),
+    organizationApi.addUsers(organizationWithRole.id, [user.id]),
+  ]);
+  await organizationApi.addUserRoles(organizationWithRole.id, user.id, [organizationRole.id]);
+
+  return {
+    accessControl: {
+      ...createDefaultApplicationAccessControl(),
+      userIds: [user.id],
+      userRoleIds: [userRole.id],
+      organizationIds: [organization.id],
+      organizationRoleRules: [
+        {
+          organizationId: organizationWithRole.id,
+          organizationRoleIds: [organizationRole.id],
+        },
+      ],
+    } satisfies ApplicationAccessControl,
+    tableDetails: {
+      username,
+      userId: user.id,
+      userRoleName: userRole.name,
+      organizationName: organization.name,
+      organizationRoleRuleName: `${organizationWithRole.name} - ${organizationRole.name}`,
+    },
+    cleanup: async () =>
+      Promise.allSettled([
+        deleteDefaultTenantUser(user.id),
+        deleteRole(userRole.id),
+        organizationApi.cleanUp(),
+      ]),
+  };
+};
+
+const expectAccessControlTableDetails = async ({
+  username,
+  userId,
+  userRoleName,
+  organizationName,
+  organizationRoleRuleName,
+}: Awaited<ReturnType<typeof createAccessControlFixtures>>['tableDetails']) => {
+  await expect(page).toMatchElement('table tbody tr td', { text: username });
+  await expect(page).toMatchElement('table tbody tr td', { text: userId });
+  await expect(page).toMatchElement('table tbody tr td', { text: userRoleName });
+  await expect(page).toMatchElement('table tbody tr td', { text: organizationName });
+  await expect(page).toMatchElement('table tbody tr td', { text: organizationRoleRuleName });
+};
+
 devFeatureTest.describe('application access control Console', () => {
   const logtoConsoleUrl = new URL(logtoConsoleUrlString);
 
@@ -72,43 +153,14 @@ devFeatureTest.describe('application access control Console', () => {
   });
 
   it('renders rules tab and table details, then saves enabled-state changes', async () => {
-    const organizationApi = new OrganizationApiTest();
-    const { user, username } = await createDefaultTenantUserWithPassword();
-    const userRole = await createRole({ name: generateTestName(), type: RoleType.User });
+    const accessControlFixtures = await createAccessControlFixtures();
     const [application, machineToMachineApplication] = await Promise.all([
       createApplication(generateTestName(), ApplicationType.SPA),
       createApplication(generateTestName(), ApplicationType.MachineToMachine),
     ]);
 
     try {
-      const [organization, organizationWithRole] = await Promise.all([
-        organizationApi.create({ name: generateTestName() }),
-        organizationApi.create({ name: generateTestName() }),
-      ]);
-      const organizationRole = await organizationApi.roleApi.create({
-        name: generateTestName(),
-        type: RoleType.User,
-      });
-
-      await Promise.all([
-        assignUsersToRole([user.id], userRole.id),
-        organizationApi.addUsers(organization.id, [user.id]),
-        organizationApi.addUsers(organizationWithRole.id, [user.id]),
-      ]);
-      await organizationApi.addUserRoles(organizationWithRole.id, user.id, [organizationRole.id]);
-
-      await replaceApplicationAccessControl(application.id, {
-        ...createDefaultApplicationAccessControl(),
-        userIds: [user.id],
-        userRoleIds: [userRole.id],
-        organizationIds: [organization.id],
-        organizationRoleRules: [
-          {
-            organizationId: organizationWithRole.id,
-            organizationRoleIds: [organizationRole.id],
-          },
-        ],
-      });
+      await replaceApplicationAccessControl(application.id, accessControlFixtures.accessControl);
       await updateApplication(application.id, { appLevelAccessControlEnabled: true });
 
       await expectNavigation(
@@ -142,13 +194,7 @@ devFeatureTest.describe('application access control Console', () => {
       const isEnabled = await page.$eval('label[class$=switch] input', (input) => input.checked);
       expect(isEnabled).toBe(true);
 
-      await expect(page).toMatchElement('table tbody tr td', { text: username });
-      await expect(page).toMatchElement('table tbody tr td', { text: user.id });
-      await expect(page).toMatchElement('table tbody tr td', { text: userRole.name });
-      await expect(page).toMatchElement('table tbody tr td', { text: organization.name });
-      await expect(page).toMatchElement('table tbody tr td', {
-        text: `${organizationWithRole.name} - ${organizationRole.name}`,
-      });
+      await expectAccessControlTableDetails(accessControlFixtures.tableDetails);
 
       await expect(page).toClick('label[class$=switch]');
       await expectToSaveChanges(page);
@@ -161,18 +207,23 @@ devFeatureTest.describe('application access control Console', () => {
       await Promise.allSettled([
         deleteApplication(application.id),
         deleteApplication(machineToMachineApplication.id),
-        deleteDefaultTenantUser(user.id),
-        deleteRole(userRole.id),
-        organizationApi.cleanUp(),
+        accessControlFixtures.cleanup(),
       ]);
     }
   });
 
-  it('renders the rules tab for SAML applications', async () => {
-    const { application: samlApplication, shouldDelete: shouldDeleteSamlApplication } =
-      await createOrReuseSamlApplication();
+  it('renders SAML rules tab and table details, then saves enabled-state changes', async () => {
+    const samlApplicationFixtures = await createOrReuseSamlApplication();
+    const accessControlFixtures = await createAccessControlFixtures();
+    const { application: samlApplication } = samlApplicationFixtures;
 
     try {
+      await replaceApplicationAccessControl(
+        samlApplication.id,
+        accessControlFixtures.accessControl
+      );
+      await updateSamlApplication(samlApplication.id, { appLevelAccessControlEnabled: true });
+
       await expectNavigation(
         page.goto(
           appendPathname(`/console/applications/${samlApplication.id}/rules`, logtoConsoleUrl).href
@@ -183,10 +234,25 @@ devFeatureTest.describe('application access control Console', () => {
       await expect(page).toMatchElement('div[class$=title]', {
         text: 'Enable app-level access control',
       });
+      await page.waitForSelector('label[class$=switch] input:not(:disabled)');
+
+      const isEnabled = await page.$eval('label[class$=switch] input', (input) => input.checked);
+      expect(isEnabled).toBe(true);
+
+      await expectAccessControlTableDetails(accessControlFixtures.tableDetails);
+
+      await expect(page).toClick('label[class$=switch]');
+      await expectToSaveChanges(page);
+      await waitForToast(page, { text: 'Saved' });
+
+      await expect(getSamlApplication(samlApplication.id)).resolves.toMatchObject({
+        appLevelAccessControlEnabled: false,
+      });
     } finally {
-      if (shouldDeleteSamlApplication) {
-        await deleteSamlApplication(samlApplication.id);
-      }
+      await Promise.allSettled([
+        resetOrDeleteSamlApplication(samlApplicationFixtures),
+        accessControlFixtures.cleanup(),
+      ]);
     }
   });
 
@@ -235,6 +301,57 @@ devFeatureTest.describe('application access control Console', () => {
     } finally {
       await Promise.allSettled([
         deleteApplication(application.id),
+        deleteDefaultTenantUser(user.id),
+      ]);
+    }
+  });
+
+  it('adds and removes user rules from the SAML rules tab', async () => {
+    const { user, username } = await createDefaultTenantUserWithPassword();
+    const samlApplicationFixtures = await createOrReuseSamlApplication();
+    const { application: samlApplication } = samlApplicationFixtures;
+
+    try {
+      await expectNavigation(
+        page.goto(
+          appendPathname(`/console/applications/${samlApplication.id}/rules`, logtoConsoleUrl).href
+        )
+      );
+
+      await expect(page).toClick('label[class$=switch]');
+      await expect(page).toClick('button span', { text: 'Add rules' });
+      await expect(page).toClick('div[role=menuitem]', { text: 'Users' });
+      await expect(page).toMatchElement('.ReactModalPortal div[class$=title]', { text: 'Users' });
+      await expect(page).toFill('.ReactModalPortal input[placeholder=Search]', username);
+      await expect(page).toClick('.ReactModalPortal div[role=button]', { text: username });
+      await expectToClickModalAction(page, 'Save');
+
+      await expect(page).toMatchElement('table tbody tr td', { text: username });
+      await expectToSaveChanges(page);
+      await waitForToast(page, { text: 'Saved' });
+
+      await expect(getSamlApplication(samlApplication.id)).resolves.toMatchObject({
+        appLevelAccessControlEnabled: true,
+      });
+      await expect(getApplicationAccessControl(samlApplication.id)).resolves.toMatchObject({
+        userIds: [user.id],
+      });
+
+      await expect(page).toClick('table tbody tr button[aria-label=Remove]');
+      await expectToClickModalAction(page, 'Remove');
+      await expect(page).toClick('label[class$=switch]');
+      await expectToSaveChanges(page);
+      await waitForToast(page, { text: 'Saved' });
+
+      await expect(getSamlApplication(samlApplication.id)).resolves.toMatchObject({
+        appLevelAccessControlEnabled: false,
+      });
+      await expect(getApplicationAccessControl(samlApplication.id)).resolves.toEqual(
+        createDefaultApplicationAccessControl()
+      );
+    } finally {
+      await Promise.allSettled([
+        resetOrDeleteSamlApplication(samlApplicationFixtures),
         deleteDefaultTenantUser(user.id),
       ]);
     }
