@@ -1,5 +1,19 @@
 # Change Log
 
+## 1.14.0
+
+### Minor Changes
+
+- 67b99bba85: apply the tenant username policy in sign-in experience and account center username forms
+
+  Usernames entered during sign-up, profile fulfillment, and account center editing are validated against the tenant username policy with localized inline errors. The dedicated username pages (continue flow and account center) state the policy requirements in their page description, and the sign-up identifier form surfaces the full requirements sentence when an entered username violates the policy.
+
+### Patch Changes
+
+- Updated dependencies [e1fadfb1a]
+- Updated dependencies [a88413689]
+  - @logto/core-kit@2.11.0
+
 ## 1.13.3
 
 ### Patch Changes

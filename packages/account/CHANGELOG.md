@@ -1,5 +1,17 @@
 # @logto/account
 
+## 0.5.0
+
+### Minor Changes
+
+- c1ff0c1142: release account center profile page, custom profile fields at sign-up, and experience/account avatar upload from dev feature gates
+
+  The collect-user-profile sign-up flow now respects the explicit `signUpProfileFields` list instead of always showing the full catalog. The account center profile page and avatar upload endpoints are no longer gated behind a dev feature flag.
+
+- 67b99bba85: apply the tenant username policy in sign-in experience and account center username forms
+
+  Usernames entered during sign-up, profile fulfillment, and account center editing are validated against the tenant username policy with localized inline errors. The dedicated username pages (continue flow and account center) state the policy requirements in their page description, and the sign-up identifier form surfaces the full requirements sentence when an entered username violates the policy.
+
 ## 0.4.1
 
 ### Patch Changes

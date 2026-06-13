@@ -4418,7 +4418,7 @@ importers:
   packages/create:
     dependencies:
       '@logto/cli':
-        specifier: workspace:^1.40.1
+        specifier: workspace:^1.41.0
         version: link:../cli
 
   packages/demo-app:

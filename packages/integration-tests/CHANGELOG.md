@@ -1,5 +1,11 @@
 # Change Log
 
+## 1.21.1
+
+### Patch Changes
+
+- 9847dfd134: fix one-time token consent handling for switch-account sign-in flows
+
 ## 1.21.0
 
 ### Minor Changes

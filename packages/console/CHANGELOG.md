@@ -1,5 +1,30 @@
 # Change Log
 
+## 1.38.0
+
+### Minor Changes
+
+- c1ff0c1142: release account center profile page, custom profile fields at sign-up, and experience/account avatar upload from dev feature gates
+
+  The collect-user-profile sign-up flow now respects the explicit `signUpProfileFields` list instead of always showing the full catalog. The account center profile page and avatar upload endpoints are no longer gated behind a dev feature flag.
+
+- 67b99bba85: add username policy management to the sign-in experience advanced options
+
+  Operators can configure the tenant username policy — case sensitivity, length bounds, and allowed character types — from Console → Sign-in experience → Sign-up and sign-in → Advanced options. Switching to case-insensitive proactively detects existing usernames that differ only by case and blocks the save until the conflicts are resolved.
+
+- eb45edbe34: allow customizing verification code settings
+
+  Admins can configure the verification code expiration duration and maximum retry attempts in Console Security settings.
+
+### Patch Changes
+
+- 92560f6b2e: fix Console username update returning 401 by redirecting to Account Center
+
+  The Account API requires identity verification for username changes, which the
+  Console profile page does not implement. Redirect username editing to the
+  Account Center's `/account/username` page (same pattern as MFA) where the full
+  verification flow is already implemented.
+
 ## 1.37.0
 
 ### Minor Changes
