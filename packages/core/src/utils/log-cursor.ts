@@ -27,6 +27,25 @@ const logCursorGuard = z.object({
 export const encodeLogCursor = ({ createdAt, id }: LogCursor) =>
   Buffer.from(JSON.stringify({ createdAt, id }), 'utf8').toString('base64url');
 
+type LogCursorPageRow = {
+  id: string;
+  createdAtCursor: string;
+};
+
+export const buildLogCursorPage = <Row extends LogCursorPageRow>(
+  rows: readonly Row[],
+  limit: number
+): { logs: readonly Row[]; nextCursor?: string } => {
+  const logs = rows.length > limit ? rows.slice(0, limit) : rows;
+  const lastItem = logs.at(-1);
+  const nextCursor =
+    rows.length > limit && lastItem
+      ? encodeLogCursor({ createdAt: lastItem.createdAtCursor, id: lastItem.id })
+      : undefined;
+
+  return { logs, nextCursor };
+};
+
 /**
  * Decode an opaque cursor. An omitted cursor is allowed; empty or malformed cursors throw a
  * `400` validation error.
@@ -36,24 +55,9 @@ export const decodeLogCursor = (raw?: string): Optional<LogCursor> => {
     return undefined;
   }
 
-  if (raw.trim() === '') {
-    throw invalidCursor();
-  }
-
   try {
-    const decoded: unknown = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'));
-    const result = logCursorGuard.safeParse(decoded);
-
-    if (!result.success) {
-      throw invalidCursor();
-    }
-
-    return result.data;
-  } catch (error) {
-    if (error instanceof RequestError) {
-      throw error;
-    }
-
+    return logCursorGuard.parse(JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')));
+  } catch {
     throw invalidCursor();
   }
 };

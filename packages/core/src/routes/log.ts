@@ -8,25 +8,26 @@ import {
   saml,
   trustedDevice,
   type AuditLogPrefix,
-  type LogResponse,
 } from '@logto/schemas';
 import { yes } from '@silverhand/essentials';
-import { boolean, number, object, string } from 'zod';
+import { boolean, literal, number, object, string } from 'zod';
 import type { z } from 'zod';
 
 import RequestError from '#src/errors/RequestError/index.js';
 import koaGuard from '#src/middleware/koa-guard.js';
 import koaPagination from '#src/middleware/koa-pagination.js';
-import type { LogCursorRow } from '#src/queries/log.js';
 import assertThat from '#src/utils/assert-that.js';
-import { decodeLogCursor, encodeLogCursor } from '#src/utils/log-cursor.js';
+import { buildLogCursorPage, decodeLogCursor } from '#src/utils/log-cursor.js';
 import { parseTimestampParam, validateTimeWindow } from '#src/utils/time-window.js';
 
 import type { ManagementApiRouter, RouterInitArgs } from './types.js';
 
-// `limit` bounds how many rows one delete call processes. Each call is a single
-// `delete ... where ctid = any(array(select ... limit N))` statement, so the bound keeps a call
-// clear of the pool's `statement_timeout` and avoids a burst of dead tuples/WAL.
+// `limit` bounds how many rows one call deletes. Each call is a single
+// `delete ... where ctid = any(array(select ... limit N))` statement, so the bound is what keeps a
+// call short: it stays clear of the pool's `statement_timeout`, holds few row locks at a time, and
+// avoids producing a burst of dead tuples and WAL that would compete with normal request traffic.
+// 1000 is a safe default for both interactive and scripted callers; 10000 is the ceiling for
+// callers that would trade a longer call for fewer round trips.
 const defaultDeleteLimit = 1000;
 const maxDeleteLimit = 10_000;
 
@@ -83,21 +84,32 @@ const parseBound = (raw: string | undefined, type: string): number | undefined =
   return value;
 };
 
-// Drop the internal cursor timestamp before returning the public log shape.
-const toLogResponse = (log: LogCursorRow): LogResponse => ({
-  tenantId: log.tenantId,
-  id: log.id,
-  key: log.key,
-  payload: log.payload,
-  createdAt: log.createdAt,
-});
+const parseRequiredNonFutureTimeWindow = (
+  start_time: string | undefined,
+  end_time: string | undefined
+): { startTime?: number; endTime: number } => {
+  const endTime = parseBound(end_time, 'end_time');
+
+  if (endTime === undefined) {
+    throw invalidInput('end_time');
+  }
+
+  const startTime = parseBound(start_time, 'start_time');
+  validateTimeWindow(startTime, endTime);
+  assertThat(
+    endTime <= Date.now(),
+    new RequestError({ code: 'log.cleanup_boundary_in_future', status: 400 })
+  );
+
+  return { startTime, endTime };
+};
 
 const logQueryGuard = object({
   userId: string().optional(),
   applicationId: string().optional(),
   logKey: string().optional(),
   enableCap: string().optional(),
-  pagination: string().optional(),
+  pagination: literal('cursor').optional(),
   cursor: string().max(512).optional(),
   limit: string().optional(),
   start_time: string().optional(),
@@ -132,34 +144,6 @@ const rejectUnsupportedPaginationParams = (
       });
     }
   }
-};
-
-const parseLogTimeWindow = (
-  query: LogQuery,
-  mode: 'page' | 'cursor'
-): { startTime?: number; endTime?: number } => {
-  if (mode === 'cursor') {
-    const endTime = parseBound(query.end_time, 'end_time');
-
-    if (endTime === undefined) {
-      throw invalidInput('end_time');
-    }
-
-    const startTime = parseBound(query.start_time, 'start_time');
-    validateTimeWindow(startTime, endTime);
-    assertThat(
-      endTime <= Date.now(),
-      new RequestError({ code: 'log.cleanup_boundary_in_future', status: 400 })
-    );
-
-    return { startTime, endTime };
-  }
-
-  const startTime = parseTimestampParam(query.start_time, 'start_time');
-  const endTime = parseTimestampParam(query.end_time, 'end_time');
-  validateTimeWindow(startTime, endTime);
-
-  return { startTime, endTime };
 };
 
 export default function logRoutes<T extends ManagementApiRouter>(
@@ -220,17 +204,9 @@ export default function logRoutes<T extends ManagementApiRouter>(
       after: cursor,
     });
 
-    const items = rows.length > limit ? rows.slice(0, limit) : rows;
-    const lastItem = items.at(-1);
-    const nextCursor =
-      rows.length > limit && lastItem
-        ? encodeLogCursor({
-            createdAt: lastItem.createdAtCursor,
-            id: lastItem.id,
-          })
-        : undefined;
+    const { logs, nextCursor } = buildLogCursorPage(rows, limit);
 
-    return { logs: items.map((item) => toLogResponse(item)), nextCursor };
+    return { logs, nextCursor };
   };
 
   router.get(
@@ -246,7 +222,6 @@ export default function logRoutes<T extends ManagementApiRouter>(
     async (ctx, next) => {
       const { query } = ctx.guard;
       const cursorMode = query.pagination === 'cursor';
-      assertThat(query.pagination === undefined || cursorMode, invalidInput('pagination'));
 
       if (cursorMode) {
         rejectUnsupportedPaginationParams(ctx.request.query, 'cursor', [
@@ -258,7 +233,7 @@ export default function logRoutes<T extends ManagementApiRouter>(
           'logKey',
         ]);
 
-        const timeWindow = parseLogTimeWindow(query, 'cursor');
+        const timeWindow = parseRequiredNonFutureTimeWindow(query.start_time, query.end_time);
         const { logs, nextCursor } = await listLogsByCursor(query, timeWindow);
 
         ctx.body = logs;
@@ -272,8 +247,14 @@ export default function logRoutes<T extends ManagementApiRouter>(
 
       rejectUnsupportedPaginationParams(ctx.request.query, 'page', ['cursor', 'limit']);
 
-      const timeWindow = parseLogTimeWindow(query, 'page');
-      const { count, isCapped, logs } = await listLogsByPage(query, ctx.pagination, timeWindow);
+      const startTime = parseTimestampParam(query.start_time, 'start_time');
+      const endTime = parseTimestampParam(query.end_time, 'end_time');
+      validateTimeWindow(startTime, endTime);
+
+      const { count, isCapped, logs } = await listLogsByPage(query, ctx.pagination, {
+        startTime,
+        endTime,
+      });
 
       // Return totalCount to pagination middleware
       ctx.pagination.totalCount = count;
@@ -320,33 +301,15 @@ export default function logRoutes<T extends ManagementApiRouter>(
     async (ctx, next) => {
       const { query } = ctx.guard;
 
-      const endTime = parseBound(query.end_time, 'end_time');
-
-      // `end_time` is required by the guard, so `parseBound` only returns `undefined` when the
-      // parameter is absent; throw rather than falling back to a default window.
-      if (endTime === undefined) {
-        throw invalidInput('end_time');
-      }
-
-      const startTime = parseBound(query.start_time, 'start_time');
+      const { startTime, endTime } = parseRequiredNonFutureTimeWindow(
+        query.start_time,
+        query.end_time
+      );
 
       const limit = query.limit === undefined ? defaultDeleteLimit : Number(query.limit);
       assertThat(
         Number.isInteger(limit) && limit >= 1 && limit <= maxDeleteLimit,
         invalidInput('limit')
-      );
-
-      // Same bound-ordering rule as `GET /logs`, reusing its error code so the two endpoints
-      // reject the same window for the same reason.
-      validateTimeWindow(startTime, endTime);
-
-      // A boundary in the future is almost always a unit mistake — microseconds or nanoseconds
-      // passed where milliseconds are expected — or a miscomputed timezone offset, and either
-      // would turn a bounded delete into an unbounded one. (Passing seconds yields a boundary in
-      // the past, which deletes nothing rather than too much.)
-      assertThat(
-        endTime <= Date.now(),
-        new RequestError({ code: 'log.cleanup_boundary_in_future', status: 400 })
       );
 
       const { deletedCount, deletedRange } = await deleteLogsInRange({

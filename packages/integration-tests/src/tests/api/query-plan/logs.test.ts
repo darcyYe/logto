@@ -89,6 +89,23 @@ describe('logs query plans under the tenant role', () => {
     expect(hasSortNode(plan)).toBe(false);
   });
 
+  it('seeks the cursor keyset in index order', async () => {
+    // Mirrors `findLogsForCursor`: audit key prefixes + time window + `(created_at, id)` cursor,
+    // ascending. The row comparison must stay an index condition under RLS.
+    const plan = await explain(sql`
+      select id from logs
+      where (key like ${'Interaction.%'} or key like ${'Unknown%'})
+        and created_at >= now() - interval '1 day'
+        and created_at < now()
+        and (created_at, id) > (now() - interval '1 hour', ${'qp-log-1'})
+      order by created_at, id
+      limit ${501}
+    `);
+
+    expectIndexCondition(plan, /ROW\(created_at/);
+    expect(hasSortNode(plan)).toBe(false);
+  });
+
   it('seeks the webhook execution stats by hook id and time', async () => {
     // Mirrors the query in `getHookExecutionStatsByHookId`.
     const startTimeExclusive = Date.now() - 24 * 60 * 60 * 1000;

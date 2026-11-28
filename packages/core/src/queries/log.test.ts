@@ -111,6 +111,15 @@ describe('log reads', () => {
 
     await expect(findLogById('log-1')).resolves.toEqual({ ...storedLog, payload: maskedPayload });
   });
+
+  it('masks stored secrets in findLogsForCursor()', async () => {
+    const cursorRow = { ...storedLog, createdAtCursor: '2020-09-13T12:26:40.001000Z' };
+    mockQuery.mockResolvedValueOnce(createMockQueryResult([cursorRow] as never));
+
+    await expect(findLogsForCursor(20, {})).resolves.toEqual([
+      { ...cursorRow, payload: maskedPayload },
+    ]);
+  });
 });
 
 describe('countLogs()', () => {
