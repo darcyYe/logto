@@ -14,9 +14,16 @@ import { subDays } from 'date-fns';
 import { buildFindEntityByIdWithPool } from '#src/database/find-entity-by-id.js';
 import { buildInsertIntoWithPool } from '#src/database/insert-into.js';
 import type { LogCursor } from '#src/utils/log-cursor.js';
+import { sanitizeLogContextPayload } from '#src/utils/sensitive-data.js';
 import { conditionalSql, convertToIdentifiers } from '#src/utils/sql.js';
 
 const { table, fields } = convertToIdentifiers(Logs);
+
+// Rows written before the current masking rules may still hold secrets, so mask on read as well.
+const sanitizeLog = <T extends { payload: Log['payload'] }>(log: T): T => ({
+  ...log,
+  payload: sanitizeLogContextPayload(log.payload),
+});
 
 type AllowedKeyPrefix = AuditLogPrefix | WebhookLogPrefix;
 
@@ -129,8 +136,8 @@ export const createLogQueries = (pool: CommonQueryMethods) => {
     return { count: numericCount, isCapped: numericCount > LOGS_COUNT_CAP };
   };
 
-  const findLogs = async (limit: number, offset: number, logCondition: LogCondition) =>
-    pool.any<Log>(sql`
+  const findLogs = async (limit: number, offset: number, logCondition: LogCondition) => {
+    const logs = await pool.any<Log>(sql`
       select ${sql.join(Object.values(fields), sql`,`)}
       from ${table}
       ${buildLogConditionSql(logCondition)}
@@ -139,6 +146,9 @@ export const createLogQueries = (pool: CommonQueryMethods) => {
       offset ${offset}
     `);
 
+    return logs.map((log) => sanitizeLog(log));
+  };
+
   /**
    * Read one keyset page for the cursor mode of `GET /logs`.
    *
@@ -146,17 +156,12 @@ export const createLogQueries = (pool: CommonQueryMethods) => {
    * exposes, and once as exact UTC text for the next page's cursor. The default `timestamptz`
    * parser is `Date.parse`, which truncates microseconds; feeding that millisecond value back
    * into the cursor would move the cursor backward and re-read rows that share a millisecond.
-   *
-   * Ascending order matches the cursor comparator, so the composite
-   * `(tenant_id, created_at, id)` index can satisfy both the range filter and the ordering.
-   * The route requests `limit + 1` rows, then returns the first `limit` and uses the extra row
-   * only to decide whether the `Next-Cursor` response header should be set.
    */
   const findLogsForCursor = async (
     limit: number,
     logCondition: LogCondition
-  ): Promise<readonly LogCursorRow[]> =>
-    pool.any<LogCursorRow>(sql`
+  ): Promise<readonly LogCursorRow[]> => {
+    const rows = await pool.any<LogCursorRow>(sql`
       select
         ${fields.tenantId},
         ${fields.id},
@@ -173,7 +178,11 @@ export const createLogQueries = (pool: CommonQueryMethods) => {
       limit ${limit}
     `);
 
-  const findLogById = buildFindEntityByIdWithPool(pool)(Logs);
+    return rows.map((row) => sanitizeLog(row));
+  };
+
+  const findRawLogById = buildFindEntityByIdWithPool(pool)(Logs);
+  const findLogById = async (id: string) => sanitizeLog(await findRawLogById(id));
 
   const deleteLogsInRange = async (condition: {
     endTime: number;
@@ -251,6 +260,7 @@ export const createLogQueries = (pool: CommonQueryMethods) => {
       from ${table}
       where ${fields.createdAt} > to_timestamp(${startTimeExclusive}::double precision / 1000)
       and ${fields.payloadHookId} = ${hookId}
+      and not (${fields.payload} ? 'nextAttemptAt')
     `);
   };
 
